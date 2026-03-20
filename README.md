@@ -6,9 +6,13 @@
 
 - 桌面端登录 Google Drive
 - 导出 setup bundle 给其他设备
+- 显示上次同步时间和设备
 - Push 当前文件
 - Push 全部本地变更并覆盖远端
 - Pull 全部远端变更并覆盖本地
+- 可选 `Pull on startup`
+- 可选 `Push after save`
+- 状态栏显示实时同步进度
 
 ## 当前边界
 
@@ -73,7 +77,10 @@
 
 - `Client ID`: 填 Google OAuth Desktop App 的 client ID
 - `Client Secret`: 如果 Google Cloud 控制台显示了 secret，就一并填入
+- `This device name`: 用于记录“上次同步设备”
 - `Remote vault name`: `My Drive` 里的可见文件夹名，默认取当前 vault 名
+- `Pull on startup`: vault 打开后自动拉取一次
+- `Push after save`: 文件保存后延迟自动推送一次
 - `.obsidian allow list`: 默认只同步少量稳定配置文件
 
 升级自旧版 `appDataFolder` 实现时，记得重新登录一次，因为 OAuth scope 已切到 `drive.file`。
@@ -117,11 +124,17 @@ http://127.0.0.1:{随机端口}/oauth2callback
    - 切换到某个设备前先 `Pull all`
    - 编辑完成后再 `Push all`
 
+如果你开启自动项，建议这样用：
+
+- `Pull on startup`: 适合所有设备默认开启
+- `Push after save`: 建议只在你的主编辑设备上开启
+
 ## 当前同步规则
 
 - `Push all`: 当前设备覆盖远端，可删除远端多余文件
 - `Pull all`: 远端覆盖当前设备，可删除本地多余文件
 - 这版故意不做复杂冲突合并，手动 Push/Pull 的方向就是唯一真源
+- 状态栏会显示实时进度，例如 `Pushing 8/42 (19%)`
 
 ## 已知限制
 

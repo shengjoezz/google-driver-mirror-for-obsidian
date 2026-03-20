@@ -9,6 +9,7 @@ const {
   normalizePath,
   requestUrl,
   arrayBufferToHex,
+  debounce,
 } = require("obsidian");
 const QRCode = require("qrcode");
 
@@ -72,9 +73,12 @@ const DEFAULT_SETTINGS = {
   storageProviderVersion: STORAGE_PROVIDER_VERSION,
   clientId: "",
   clientSecret: "",
+  deviceLabel: "",
   remoteVaultName: "",
   includeExtensions: DEFAULT_INCLUDE_EXTENSIONS,
   excludedPathPrefixes: DEFAULT_EXCLUDED_PREFIXES,
+  autoPullOnStartup: false,
+  autoPushAfterSave: false,
   syncObsidianFiles: false,
   obsidianAllowlist: DEFAULT_OBSIDIAN_ALLOWLIST,
   storedTokensFallback: null,
@@ -82,6 +86,8 @@ const DEFAULT_SETTINGS = {
   lastLocalManifest: {},
   lastRemoteManifest: {},
   lastSyncAt: null,
+  lastSyncDevice: "",
+  lastSyncAction: "",
   lastRemoteFolderId: "",
 };
 
@@ -92,10 +98,17 @@ module.exports = class GoogleDriveMirrorPlugin extends Plugin {
     this.pendingAuthPromise = null;
     this.cachedTokens = null;
     this.remoteRootFolderCache = null;
+    this.progressNotice = null;
+    this.progressMessage = "";
+    this.suppressAutoPush = false;
     this.statusBar = this.addStatusBarItem();
 
     await this.loadSettings();
-    this.addSettingTab(new GoogleDriveMirrorSettingTab(this.app, this));
+    this.settingTab = new GoogleDriveMirrorSettingTab(this.app, this);
+    this.addSettingTab(this.settingTab);
+    this.autoPushDebounced = debounce(async () => {
+      await this.pushAllChanges({ silent: true, reason: "auto-save" });
+    }, 5000, true);
 
     this.addRibbonIcon("cloud-upload", "Push all local changes to Google Drive", async () => {
       await this.pushAllChanges();
@@ -182,6 +195,11 @@ module.exports = class GoogleDriveMirrorPlugin extends Plugin {
       }
     });
 
+    this.registerVaultAutoPushHandlers();
+    this.app.workspace.onLayoutReady(() => {
+      void this.handleStartupAutoPull();
+    });
+
     this.setStatus("idle");
   }
 
@@ -190,11 +208,16 @@ module.exports = class GoogleDriveMirrorPlugin extends Plugin {
       this.authSession.close();
       this.authSession = null;
     }
+    this.autoPushDebounced?.cancel?.();
+    this.hideProgressNotice();
   }
 
   async loadSettings() {
     const loaded = (await this.loadData()) || {};
     this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded);
+    if (!this.settings.deviceLabel) {
+      this.settings.deviceLabel = this.defaultDeviceLabel();
+    }
     this.cachedTokens = this.settings.storedTokensFallback || null;
     this.remoteRootFolderCache = null;
 
@@ -232,6 +255,12 @@ module.exports = class GoogleDriveMirrorPlugin extends Plugin {
     await this.saveData(this.settings);
   }
 
+  refreshSettingsUi() {
+    if (this.settingTab) {
+      this.settingTab.display();
+    }
+  }
+
   async rememberRemoteRootFolder(folderId, folderName) {
     if (!folderId) {
       return;
@@ -248,6 +277,7 @@ module.exports = class GoogleDriveMirrorPlugin extends Plugin {
 
     this.settings.lastRemoteFolderId = folderId;
     await this.saveSettings();
+    this.refreshSettingsUi();
   }
 
   getRemoteFolderUrl() {
@@ -264,13 +294,17 @@ module.exports = class GoogleDriveMirrorPlugin extends Plugin {
   }
 
   setStatus(label) {
-    const suffix = this.operationLabel ? this.operationLabel : label;
+    const suffix = this.progressMessage || (this.operationLabel ? this.operationLabel : label);
     this.statusBar.setText(`Google Drive Mirror: ${suffix}`);
   }
 
   defaultRemoteVaultName() {
     const name = (this.app.vault.getName() || "default-vault").trim();
     return name.replace(/[\\/:*?"<>|]/g, "-") || "default-vault";
+  }
+
+  defaultDeviceLabel() {
+    return inferDefaultDeviceLabel();
   }
 
   async runOperation(label, fn) {
@@ -289,9 +323,86 @@ module.exports = class GoogleDriveMirrorPlugin extends Plugin {
       new Notice(this.formatError(error), 8000);
       throw error;
     } finally {
+      this.hideProgressNotice();
       this.operationLabel = null;
+      this.progressMessage = "";
       this.setStatus("idle");
+      this.refreshSettingsUi();
     }
+  }
+
+  showProgressNotice(message, silent) {
+    if (silent) {
+      return;
+    }
+
+    if (!this.progressNotice) {
+      this.progressNotice = new Notice(message, 0);
+      return;
+    }
+
+    this.progressNotice.setMessage(message);
+  }
+
+  updateProgress(label, current, total, detail, silent) {
+    const safeTotal = Number(total || 0);
+    const safeCurrent = Number(current || 0);
+    let progressLabel = label;
+
+    if (safeTotal > 0) {
+      const percentage = Math.min(100, Math.round((safeCurrent / safeTotal) * 100));
+      progressLabel = `${label} ${safeCurrent}/${safeTotal} (${percentage}%)`;
+    }
+
+    if (detail) {
+      progressLabel = `${progressLabel} - ${detail}`;
+    }
+
+    this.progressMessage = progressLabel;
+    this.setStatus(progressLabel);
+    this.showProgressNotice(progressLabel, silent);
+  }
+
+  hideProgressNotice() {
+    if (this.progressNotice) {
+      this.progressNotice.hide();
+      this.progressNotice = null;
+    }
+  }
+
+  recordSyncMetadata(action) {
+    this.settings.lastSyncAt = new Date().toISOString();
+    this.settings.lastSyncDevice = this.settings.deviceLabel || this.defaultDeviceLabel();
+    this.settings.lastSyncAction = action;
+  }
+
+  hasUsableAuth() {
+    return Boolean(this.settings.clientId.trim() && this.loadStoredTokens()?.accessToken);
+  }
+
+  registerVaultAutoPushHandlers() {
+    const queueAutoPush = () => {
+      if (!this.settings.autoPushAfterSave || this.suppressAutoPush || !this.hasUsableAuth()) {
+        return;
+      }
+
+      this.progressMessage = "auto push queued";
+      this.setStatus("auto push queued");
+      this.autoPushDebounced();
+    };
+
+    this.registerEvent(this.app.vault.on("create", () => queueAutoPush()));
+    this.registerEvent(this.app.vault.on("modify", () => queueAutoPush()));
+    this.registerEvent(this.app.vault.on("delete", () => queueAutoPush()));
+    this.registerEvent(this.app.vault.on("rename", () => queueAutoPush()));
+  }
+
+  async handleStartupAutoPull() {
+    if (!this.settings.autoPullOnStartup || !this.hasUsableAuth()) {
+      return;
+    }
+
+    await this.pullRemoteChanges({ silent: true, reason: "startup" });
   }
 
   async beginSignIn() {
@@ -574,6 +685,7 @@ module.exports = class GoogleDriveMirrorPlugin extends Plugin {
     }
 
     await this.saveSettings();
+    this.refreshSettingsUi();
   }
 
   loadStoredTokens() {
@@ -607,6 +719,7 @@ module.exports = class GoogleDriveMirrorPlugin extends Plugin {
       this.app.secretStorage.setSecret(TOKEN_SECRET_ID, "");
     }
     await this.saveSettings();
+    this.refreshSettingsUi();
   }
 
   buildSetupBundle() {
@@ -717,6 +830,7 @@ module.exports = class GoogleDriveMirrorPlugin extends Plugin {
     await this.saveStoredTokens(tokens);
     this.settings.lastAuthError = "";
     await this.saveSettings();
+    this.refreshSettingsUi();
     new Notice("Google Drive setup bundle imported.", 8000);
   }
 
@@ -762,7 +876,8 @@ module.exports = class GoogleDriveMirrorPlugin extends Plugin {
     }
   }
 
-  async pushActiveFile() {
+  async pushActiveFile(options) {
+    const runOptions = Object.assign({ silent: false, reason: "manual" }, options || {});
     await this.runOperation("pushing active file", async () => {
       await this.requireConfigured(true);
 
@@ -780,24 +895,31 @@ module.exports = class GoogleDriveMirrorPlugin extends Plugin {
       const remoteEntry = remoteManifest[file.path] || null;
 
       let uploaded = 0;
+      this.updateProgress("Pushing current file", 0, 1, file.path, runOptions.silent);
       if (!remoteEntry || !sameRevision(localEntry, remoteEntry)) {
         remoteManifest[file.path] = await this.uploadLocalEntry(localEntry, remoteEntry);
         uploaded += 1;
       }
+      this.updateProgress("Pushing current file", 1, 1, file.path, runOptions.silent);
 
       await this.saveRemoteManifest(remoteManifest);
 
       const currentLocal = await this.buildLocalManifest(this.settings.lastLocalManifest);
       this.settings.lastLocalManifest = currentLocal;
       this.settings.lastRemoteManifest = remoteManifest;
-      this.settings.lastSyncAt = new Date().toISOString();
+      this.recordSyncMetadata(
+        runOptions.reason === "manual" ? "push current" : `push current (${runOptions.reason})`
+      );
       await this.saveSettings();
 
-      new Notice(`Push current file finished. Uploaded ${uploaded}.`);
+      if (!runOptions.silent) {
+        new Notice(`Push current file finished. Uploaded ${uploaded}.`);
+      }
     });
   }
 
-  async pushAllChanges() {
+  async pushAllChanges(options) {
+    const runOptions = Object.assign({ silent: false, reason: "manual" }, options || {});
     await this.runOperation("pushing local changes", async () => {
       await this.requireConfigured(true);
 
@@ -810,6 +932,12 @@ module.exports = class GoogleDriveMirrorPlugin extends Plugin {
         ...Object.keys(localManifest),
         ...Object.keys(remoteManifest),
       ]);
+      const total = allPaths.size;
+      let processed = 0;
+
+      if (total === 0) {
+        this.updateProgress("Pushing", 0, 0, "nothing to sync", runOptions.silent);
+      }
 
       for (const path of allPaths) {
         const localEntry = localManifest[path] || null;
@@ -826,20 +954,28 @@ module.exports = class GoogleDriveMirrorPlugin extends Plugin {
           delete remoteManifest[path];
           deleted += 1;
         }
+
+        processed += 1;
+        this.updateProgress("Pushing", processed, total, path, runOptions.silent);
       }
 
       await this.saveRemoteManifest(remoteManifest);
 
       this.settings.lastLocalManifest = localManifest;
       this.settings.lastRemoteManifest = remoteManifest;
-      this.settings.lastSyncAt = new Date().toISOString();
+      this.recordSyncMetadata(
+        runOptions.reason === "manual" ? "push all" : `push all (${runOptions.reason})`
+      );
       await this.saveSettings();
 
-      new Notice(`Push finished. Uploaded ${uploaded}, deleted ${deleted}.`, 8000);
+      if (!runOptions.silent) {
+        new Notice(`Push finished. Uploaded ${uploaded}, deleted ${deleted}.`, 8000);
+      }
     });
   }
 
-  async pullRemoteChanges() {
+  async pullRemoteChanges(options) {
+    const runOptions = Object.assign({ silent: false, reason: "manual" }, options || {});
     await this.runOperation("pulling remote changes", async () => {
       await this.requireConfigured(true);
 
@@ -852,30 +988,45 @@ module.exports = class GoogleDriveMirrorPlugin extends Plugin {
         ...Object.keys(localManifest),
         ...Object.keys(remoteManifest),
       ]);
+      const total = allPaths.size;
+      let processed = 0;
 
-      for (const path of allPaths) {
-        const remoteEntry = remoteManifest[path] || null;
-        const localEntry = localManifest[path] || null;
+      if (total === 0) {
+        this.updateProgress("Pulling", 0, 0, "nothing to sync", runOptions.silent);
+      }
 
-        if (remoteEntry && (!localEntry || !sameRevision(localEntry, remoteEntry))) {
-          await this.downloadIntoCanonicalPath(path, remoteEntry);
-          downloaded += 1;
-          continue;
+      this.suppressAutoPush = true;
+      try {
+        for (const path of allPaths) {
+          const remoteEntry = remoteManifest[path] || null;
+          const localEntry = localManifest[path] || null;
+
+          if (remoteEntry && (!localEntry || !sameRevision(localEntry, remoteEntry))) {
+            await this.downloadIntoCanonicalPath(path, remoteEntry);
+            downloaded += 1;
+          } else if (!remoteEntry && localEntry) {
+            await this.deleteLocalPath(path);
+            deleted += 1;
+          }
+
+          processed += 1;
+          this.updateProgress("Pulling", processed, total, path, runOptions.silent);
         }
-
-        if (!remoteEntry && localEntry) {
-          await this.deleteLocalPath(path);
-          deleted += 1;
-        }
+      } finally {
+        this.suppressAutoPush = false;
       }
 
       const refreshedLocalManifest = await this.buildLocalManifest(localManifest);
       this.settings.lastLocalManifest = refreshedLocalManifest;
       this.settings.lastRemoteManifest = remoteManifest;
-      this.settings.lastSyncAt = new Date().toISOString();
+      this.recordSyncMetadata(
+        runOptions.reason === "manual" ? "pull all" : `pull all (${runOptions.reason})`
+      );
       await this.saveSettings();
 
-      new Notice(`Pull finished. Downloaded ${downloaded}, deleted ${deleted}.`, 8000);
+      if (!runOptions.silent) {
+        new Notice(`Pull finished. Downloaded ${downloaded}, deleted ${deleted}.`, 8000);
+      }
     });
   }
 
@@ -1657,6 +1808,19 @@ class GoogleDriveMirrorSettingTab extends PluginSettingTab {
         button.setTooltip(authState);
       });
 
+    const lastSyncSummary = formatLastSyncSummary(
+      this.plugin.settings.lastSyncAt,
+      this.plugin.settings.lastSyncDevice,
+      this.plugin.settings.lastSyncAction
+    );
+    new Setting(containerEl)
+      .setName("Last sync")
+      .setDesc(lastSyncSummary)
+      .addExtraButton((button) => {
+        button.setIcon(this.plugin.settings.lastSyncAt ? "history" : "minus");
+        button.setTooltip("Last sync metadata");
+      });
+
     if (this.plugin.settings.lastAuthError) {
       new Setting(containerEl)
         .setName("Last auth error")
@@ -1696,6 +1860,20 @@ class GoogleDriveMirrorSettingTab extends PluginSettingTab {
               sanitizeDriveFolderName(value.trim() || this.plugin.defaultRemoteVaultName());
             this.plugin.remoteRootFolderCache = null;
             this.plugin.settings.lastRemoteFolderId = "";
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("This device name")
+      .setDesc("Stored in sync metadata so you can see which device last pushed or pulled.")
+      .addText((text) =>
+        text
+          .setPlaceholder(this.plugin.defaultDeviceLabel())
+          .setValue(this.plugin.settings.deviceLabel)
+          .onChange(async (value) => {
+            this.plugin.settings.deviceLabel =
+              value.trim() || this.plugin.defaultDeviceLabel();
             await this.plugin.saveSettings();
           })
       );
@@ -1757,6 +1935,31 @@ class GoogleDriveMirrorSettingTab extends PluginSettingTab {
       .setName("Manual sync policy")
       .setDesc(
         "Push all mirrors this device to Drive. Pull all mirrors Drive to this device. Manual sync overwrites target-side edits and deletions."
+      );
+
+    new Setting(containerEl)
+      .setName("Pull on startup")
+      .setDesc("When enabled, this device automatically pulls from Drive once after the vault layout is ready.")
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.autoPullOnStartup).onChange(async (value) => {
+          this.plugin.settings.autoPullOnStartup = value;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Push after save")
+      .setDesc("When enabled, file changes queue an automatic push after a short debounce. This still follows overwrite semantics.")
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.autoPushAfterSave).onChange(async (value) => {
+          this.plugin.settings.autoPushAfterSave = value;
+          if (!value) {
+            this.plugin.autoPushDebounced?.cancel?.();
+            this.plugin.progressMessage = "";
+            this.plugin.setStatus("idle");
+          }
+          await this.plugin.saveSettings();
+        })
       );
 
     new Setting(containerEl)
@@ -1834,7 +2037,7 @@ class GoogleDriveMirrorSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Manual actions")
-      .setDesc("This phase keeps sync fully manual.")
+      .setDesc("Use these actions directly even if automatic startup pull or save-triggered push is enabled.")
       .addButton((button) =>
         button.setButtonText("Push current").onClick(async () => {
           await this.plugin.pushActiveFile();
@@ -2028,6 +2231,17 @@ function mergeRemoteScanWithManifest(scannedFiles, manifestFiles) {
   return merged;
 }
 
+function formatLastSyncSummary(lastSyncAt, lastSyncDevice, lastSyncAction) {
+  if (!lastSyncAt) {
+    return "No sync has been recorded yet.";
+  }
+
+  const at = new Date(lastSyncAt).toLocaleString();
+  const device = lastSyncDevice || "unknown device";
+  const action = lastSyncAction || "sync";
+  return `${action} from ${device} at ${at}.`;
+}
+
 function normalizeComparableMtime(value) {
   if (value === null || value === undefined || value === "") {
     return "";
@@ -2127,6 +2341,36 @@ function stripLeadingSlash(value) {
 
 function sanitizeDriveFolderName(value) {
   return String(value || "").trim().replace(/[\\/]+/g, "-") || "default-vault";
+}
+
+function inferDefaultDeviceLabel() {
+  if (typeof navigator !== "undefined") {
+    const agent = String(navigator.userAgent || "");
+    if (/iPhone/i.test(agent)) {
+      return "iPhone";
+    }
+    if (/iPad/i.test(agent)) {
+      return "iPad";
+    }
+    if (/Windows/i.test(agent)) {
+      return "Windows";
+    }
+    if (/Macintosh|Mac OS X/i.test(agent)) {
+      return "Mac";
+    }
+    if (/Android/i.test(agent)) {
+      return "Android";
+    }
+    if (/Linux/i.test(agent)) {
+      return "Linux";
+    }
+  }
+
+  if (Platform.isDesktopApp) {
+    return "Desktop";
+  }
+
+  return "Mobile";
 }
 
 function getExtension(path) {

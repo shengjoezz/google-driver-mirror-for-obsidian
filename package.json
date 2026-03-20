@@ -1,0 +1,19 @@
+{
+  "name": "google-drive-mirror",
+  "version": "0.1.0",
+  "author": "ShengJoezz",
+  "private": true,
+  "scripts": {
+    "build": "node esbuild.config.mjs production",
+    "dev": "node esbuild.config.mjs development"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "esbuild": "^0.25.1",
+    "obsidian": "^1.8.10",
+    "typescript": "^5.8.2"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4"
+  }
+}

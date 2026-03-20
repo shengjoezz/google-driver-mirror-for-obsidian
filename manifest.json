@@ -1,0 +1,9 @@
+{
+  "id": "onedrive-mirror",
+  "name": "Google Drive Mirror",
+  "version": "0.1.0",
+  "minAppVersion": "1.11.4",
+  "description": "Manual Google Drive visible-folder push/pull for an Obsidian vault.",
+  "author": "ShengJoezz",
+  "isDesktopOnly": false
+}
